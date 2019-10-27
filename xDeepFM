@@ -1,0 +1,157 @@
+import torch
+import torch.nn as nn
+import warnings
+warnings.filterwarnings("ignore")
+from torch.utils.data import Dataset
+import numpy as np
+
+###########load data################
+'''
+distinguish category data and continuous data
+'''
+class LoadDataset(Dataset):
+    def __init__(self, category_data,continue_data,label):
+        self.category_data=category_data
+        self.continue_data = continue_data
+        self.label=label
+
+    def __getitem__(self, index):
+        category_train_data=self.category_data[index]
+        continue_train_data = self.continue_data[index]
+        train_label=self.label[index]
+        return category_train_data.float(),continue_train_data.float() ,train_label.float()
+
+    def __len__(self):
+        return len(self.label)
+
+class FM_part(torch.nn.Module):
+    def __init__(self,params):
+        super().__init__()
+        self.device=params['device']
+        self.feature_size=params['feature_size']#the whole feature length
+        self.k=params['k']#hidden vector length
+        self.bs=params['batch_size']
+
+        self.embedding=nn.Parameter(torch.empty((self.feature_size,self.k),dtype=torch.float32,
+                                 device=self.device,requires_grad=True))
+        nn.init.normal_(self.embedding)
+        self.to(self.device)
+
+    def forward(self, feature_values):
+        temp1 = torch.pow(torch.einsum('bn,nk->bk', [feature_values,self.embedding]), 2)
+        temp2 = torch.einsum('bn,nk->bk', (torch.pow(feature_values, 2),torch.pow(self.embedding, 2)))
+        second_order = 0.5*torch.sum((temp1 - temp2),dim=1)
+        return second_order,self.embedding
+
+class linear(torch.nn.Module):
+    def __init__(self,params):
+        super().__init__()
+        self.device=params['device']
+        self.feature_size=params['feature_size']
+        self.bs=params['batch_size']
+        self.weight=nn.Parameter(torch.empty((self.feature_size,1),dtype=torch.float32,
+                                 device=self.device,requires_grad=True))
+        nn.init.normal_(self.weight)
+        self.to(self.device)
+
+    def forward(self, feature_values):
+        # weight=self.weight[feature_idx,:]
+        linear=torch.mm(feature_values,self.weight)
+        return linear
+
+class DNN(torch.nn.Module):
+    def __init__(self,params,use_batchnorm=False,use_dropout=True):
+        super(DNN, self).__init__()
+        self.device=params['device']
+        self.hidden_dims=params['hidden_dims']#list，denote each layer's dimension, len(self.hidden_dims) is the network depth
+        self.p=params['p']#dropout rate
+        self.use_batchnorm=use_batchnorm
+        self.use_dropout=use_dropout
+        self.field_size=params['field_size']#field's size is feature's size which without one-hot encoding
+        self.embedding_size=params['embedding_size']
+        self.bs=params['batch_size']
+
+        self.input_dim=self.field_size*self.embedding_size
+        self.num_layers=len(self.hidden_dims)
+
+        self.deep_layers=nn.Sequential()
+        net_dims=[self.input_dim]+self.hidden_dims#从第一层到最后一层的节点数
+        for i in range(self.num_layers):
+            self.deep_layers.add_module('fc{}'.format(i+1),nn.Linear(net_dims[i],net_dims[i+1]).to(self.device))
+            if self.use_batchnorm:
+                self.deep_layers.add_module('bn{}'.format(i+1),nn.BatchNorm1d(net_dims[i+1]).to(self.device))
+            self.deep_layers.add_module('relu{}'.format(i+1),nn.ReLU().to(self.device))
+            if(self.use_dropout):
+                self.deep_layers.add_module('dropout{}'.format(i+1),nn.Dropout(self.p).to(self.device))
+        self.to(self.device)
+
+    def forward(self,embeddings):
+        deepInput=embeddings.reshape(-1,self.input_dim)
+        deepout=self.deep_layers(deepInput)
+        return deepout
+
+class CIN(torch.nn.Module):
+    def __init__(self,params):
+        super(CIN, self).__init__()
+        self.device=params['device']
+        self.field_size=params['field_size']
+        self.hidden_dims=params['cin_hidden_dims']#cin hidden depth
+        self.hidden_layer = len(self.hidden_dims)
+        self.net_dims=[self.field_size]+self.hidden_dims
+        self.embedding_size=params['embedding_size']
+        self.conv1ds=nn.ModuleList()
+        for i in range(self.hidden_layer):
+            self.conv1ds.append(nn.Conv1d(self.net_dims[0]*self.net_dims[i],self.net_dims[i+1],1))
+        self.to(self.device)
+
+    def forward(self,inputs):
+        output=torch.tensor([],requires_grad=True)
+        for batch in inputs:
+            res = []
+            h = [batch]
+            for i in range(self.hidden_layer):
+                temp=torch.einsum('hd,md->hmd',h[-1],h[0])
+                temp=temp.reshape(-1,h[-1].shape[0]*batch.shape[0],batch.shape[1])
+                temp=self.conv1ds[i](temp)
+                h.append(temp.squeeze())
+                res.append(temp)
+            res=torch.cat(res,dim=0).view(-1,self.embedding_size)
+            res=torch.sum(res,dim=1).unsqueeze(0)
+            output=torch.cat([output,res],dim=0)
+        return output
+
+'''
+    xDeepFM is design for category data
+'''
+class xDeepFM(torch.nn.Module):
+    def __init__(self,params,use_batchnorm=False,use_dropout=True):
+        super(xDeepFM, self).__init__()
+        self.device=params['device']
+
+        self.first_order=linear(params)
+        self.second_order=FM_part(params)
+        self.mlp=DNN(params,use_batchnorm=use_batchnorm,use_dropout=use_dropout)
+        self.cin=CIN(params)
+        self.bs=params['batch_size']
+
+        concat_size=1+1+params['hidden_dims'][-1]+np.array(params['cin_hidden_dims']).sum()
+        self.concat_layer=nn.Linear(concat_size,1).to(self.device)
+        self.sigmoid=nn.Sigmoid().to(self.device)
+        self.to(self.device)
+
+    def forward(self,features):
+        first_order=self.first_order(features)
+        second_order,embeddings=self.second_order(features)
+        feature_embeddings=torch.einsum("bn,nk->bnk",features,embeddings)
+
+        #######drop features which value is 0############
+        feature_embeddings=feature_embeddings.view(-1,embeddings.size()[1])
+        feature_embeddings=feature_embeddings[feature_embeddings!=torch.tensor([0.]*embeddings.size()[1])].view(self.bs,-1,embeddings.size()[1])
+
+        mlp=self.mlp(feature_embeddings)
+        cinout=self.cin(feature_embeddings)
+
+        concat=torch.cat([first_order,second_order.unsqueeze(1), mlp, cinout],dim=1)
+        logits=self.concat_layer(concat)
+        out=self.sigmoid(logits)
+        return out
